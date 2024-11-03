@@ -8,6 +8,8 @@ from tinygrad import Device, Tensor, dtypes
 from tinygrad.tensor import _to_np_dtype
 from hypothesis import given, settings, strategies as strat
 from test.helpers import is_dtype_supported, rand_for_dtype
+import pytest
+pytestmark = pytest.mark.filterwarnings("ignore")
 
 settings.register_profile("my_profile", max_examples=200, deadline=None, derandomize=getenv("DERANDOMIZE_CI", False))
 settings.load_profile("my_profile")
@@ -71,7 +73,6 @@ class TestDType(unittest.TestCase):
   def test_to_np(self):
     _test_to_np(Tensor(self.DATA, dtype=self.DTYPE), _to_np_dtype(self.DTYPE), np.array(self.DATA, dtype=_to_np_dtype(self.DTYPE)))
 
-  @np.errstate(all='ignore')
   def test_casts_to(self): list(map(
     lambda dtype: _test_cast(Tensor(self.DATA, dtype=dtype), self.DTYPE),
     get_available_cast_dtypes(self.DTYPE)
@@ -294,13 +295,50 @@ class TestUint64DType(TestDType):
 
 class TestBoolDType(TestDType): DTYPE = dtypes.bool
 
+class TestPtrDType(unittest.TestCase):
+  def test_vec_double(self):
+    dt1 = dtypes.float.vec(4).ptr().vec(4)
+    dt2 = dtypes.float.vec(4).ptr().vec(4)
+    self.assertEqual(dt1, dt2)
+    self.assertEqual(str(dt1), str(dt2))
+
+  def test_scalar(self):
+    dt = dtypes.float.vec(4).ptr().scalar()
+    self.assertEqual(dt.base, dtypes.float.vec(4))
+
+    dt = dtypes.float.vec(4).ptr().vec(4).scalar()
+    self.assertEqual(dt.base, dtypes.float.vec(4))
+
+    dt = dtypes.float.vec(4).scalar()
+    self.assertEqual(dt, dtypes.float)
+
+  def test_serialize(self):
+    dt = dtypes.float.vec(4).ptr().vec(4)
+    self.assertEqual(dt, eval(str(dt)))
+
+  def test_vcount(self):
+    dt = dtypes.float.ptr().vec(4)
+    self.assertEqual(dt.vcount, 4)
+    self.assertEqual(dt.v, 4)
+    self.assertEqual(dt.count, 1)
+
+    dt = dtypes.float.vec(4).ptr()
+    self.assertEqual(dt.vcount, 1)
+    self.assertEqual(dt.v, 1)
+    self.assertEqual(dt.count, 4)
+
+    dt = dtypes.float.vec(4).ptr().vec(4)
+    self.assertEqual(dt.vcount, 4)
+    self.assertEqual(dt.v, 4)
+    self.assertEqual(dt.count, 4)
+
 class TestImageDType(unittest.TestCase):
   def test_image_scalar(self):
-    assert dtypes.imagef((10,10)).scalar() == dtypes.float32
-    assert dtypes.imageh((10,10)).scalar() == dtypes.float32
+    assert dtypes.imagef((10,10)).base.scalar() == dtypes.float32
+    assert dtypes.imageh((10,10)).base.scalar() == dtypes.float32
   def test_image_vec(self):
-    assert dtypes.imagef((10,10)).vec(4) == dtypes.float32.vec(4)
-    assert dtypes.imageh((10,10)).vec(4) == dtypes.float32.vec(4)
+    assert dtypes.imagef((10,10)).base.vec(4) == dtypes.float32.vec(4)
+    assert dtypes.imageh((10,10)).base.vec(4) == dtypes.float32.vec(4)
 
 class TestEqStrDType(unittest.TestCase):
   def test_image_ne(self):
@@ -310,14 +348,9 @@ class TestEqStrDType(unittest.TestCase):
     assert dtypes.imageh((1,2,4)) != dtypes.imageh((1,4,2)), "different shape doesn't match"
     assert dtypes.imageh((1,2,4)) == dtypes.imageh((1,2,4)), "same shape matches"
     assert isinstance(dtypes.imageh((1,2,4)), ImageDType)
-  def test_ptr_ne(self):
-    if PtrDType is None: raise unittest.SkipTest("no PtrDType support")
-    # TODO: is this the wrong behavior?
-    assert dtypes.float32.ptr() == dtypes.float32
-    assert not (dtypes.float32.ptr() != dtypes.float32)
+  def test_ptr_eq(self):
     assert dtypes.float32.ptr() == dtypes.float32.ptr()
     assert not (dtypes.float32.ptr() != dtypes.float32.ptr())
-    #assert dtypes.float32.ptr() != dtypes.float32
   def test_strs(self):
     if PtrDType is None: raise unittest.SkipTest("no PtrDType support")
     self.assertEqual(str(dtypes.imagef((1,2,4))), "dtypes.imagef((1, 2, 4))")
@@ -421,7 +454,6 @@ class TestTypeSpec(unittest.TestCase):
       subprocess.run(['DEFAULT_FLOAT=TYPO python3 -c "from tinygrad import dtypes"'],
                       shell=True, check=True)
 
-  @np.errstate(all='ignore')
   def test_dtype_str_arg(self):
     n = np.random.normal(0, 1, (10, 10)).astype(np.float32)
     tested = 0
@@ -550,7 +582,7 @@ class TestTypePromotion(unittest.TestCase):
   @given(strat.sampled_from(core_dtypes), strat.sampled_from(core_dtypes))
   def test_promo_resulted_higher_than_inputs(self, dtype1, dtype2):
     result = least_upper_dtype(dtype1, dtype2)
-    assert result >= dtype1 and result >= dtype2
+    assert not (result < dtype1) and not (result < dtype2)
 
   def test_dtype_promo(self):
     assert least_upper_dtype(dtypes.bool, dtypes.int8) == dtypes.int8
