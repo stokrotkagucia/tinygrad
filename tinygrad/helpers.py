@@ -221,6 +221,22 @@ def diskcache(func):
 # *** process replay ***
 
 CAPTURE_PROCESS_REPLAY = getenv("RUN_PROCESS_REPLAY") or getenv("CAPTURE_PROCESS_REPLAY")
+if getenv("RUN_PROCESS_REPLAY"):
+  import atexit
+  @atexit.register
+  def run_process_replay():
+    # start by creating the reference branch (based on master)
+    if os.path.isdir(wdir:=temp("worktree_process_replay")): subprocess.check_call(["git", "worktree", "remove", wdir])
+    subprocess.check_call(["git", "branch", "-f", "process_replay_ref", "master"])
+    subprocess.check_call(["git", "worktree", "add", wdir, "process_replay_ref"])
+    # run process replay on the reference branch
+    os.environ["RUN_PROCESS_REPLAY"] = "0"
+    os.environ["PYTHONPATH"] = wdir
+    os.execv(sys.executable, [sys.executable, os.path.join(wdir, "test", "external", "process_replay", "process_replay.py")])
+  # reset process replay capture (TODO: this is making VIZ=1 RUN_PROCESS_REPLAY=1 fail!)
+  cur = db_connection()
+  cur.execute(f"drop table if exists kernel_process_replay_{VERSION}")
+  cur.execute(f"drop table if exists schedule_process_replay_{VERSION}")
 
 # *** http support ***
 

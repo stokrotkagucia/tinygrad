@@ -8,10 +8,4 @@ Note that process replay [early stops when over 20% of kernels change, for speed
 
 ## Running locally
 
-To run process replay locally:
-
-(optional: clear previous process replay runs with `test/external/process_replay/reset.py`)
-
-1. Run tests with `RUN_PROCESS_REPLAY=1` in your branch. This will capture the kernels.
-2. Checkout master
-3. Run `test/external/process_replay/process_replay.py`
+To run process replay locally, run tinygrad with `RUN_PROCESS_REPLAY=1`.
