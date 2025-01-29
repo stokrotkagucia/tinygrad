@@ -273,13 +273,23 @@
     ],
   });
   function renderGraph(graph, additions) {
-    // TODO: this should just remove the nodes that got rewritten
-    cy.elements().remove();
+    const currElements = new Set();
     for (const [id, [label, src, color]] of Object.entries(graph)) {
-      cy.add({data: {id, label}, style: {backgroundColor: color}})
-      for (const source of src) {
-        cy.add({data: {source, target: id}, classes: "edge"})
+      currElements.add(id);
+      if (cy.getElementById(id).length == 0) {
+        cy.add({data: {id, label}, style: {backgroundColor: color}})
       }
+      for (const source of src) {
+        const edgeKey = `${source}-${id}`;
+        currElements.add(edgeKey)
+        if (cy.getElementById(edgeKey).length == 0) {
+          cy.add({data: {source, target: id, id:edgeKey}, classes: "edge"})
+        }
+      }
+    }
+
+    for (const e of cy.elements()) {
+      if (!(currElements.has(e.id()))) e.remove();
     }
     cy.layout({name: "elk"}).run();
   }
