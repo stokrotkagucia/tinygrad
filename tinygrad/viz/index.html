@@ -274,6 +274,7 @@
   });
   // **** UOp graph
   function renderGraph(graph, additions) {
+    // TODO: this should just remove the nodes that got rewritten
     cy.elements().remove();
     for (const [id, [label, src, color]] of Object.entries(graph)) {
       cy.add({data:{id, label}, style: {backgroundColor: color}})
@@ -362,6 +363,8 @@
         ret = cache[cacheKey];
       }
       else {
+        // clear the graph before fetching the new one
+        cy.elements().remove();
         const p = document.querySelector(".progress");
         const limit = 100;
         const pageCount = Math.ceil((kernels[currentKernel][1][currentUOp].match_count+1)/limit);
