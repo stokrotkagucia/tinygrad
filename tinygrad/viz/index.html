@@ -272,17 +272,16 @@
       },
     ],
   });
-  // **** UOp graph
   function renderGraph(graph, additions) {
     // TODO: this should just remove the nodes that got rewritten
     cy.elements().remove();
     for (const [id, [label, src, color]] of Object.entries(graph)) {
-      cy.add({data:{id, label}, style: {backgroundColor: color}})
+      cy.add({data: {id, label}, style: {backgroundColor: color}})
       for (const source of src) {
-        cy.add({data:{source, target:id}, classes: "edge"})
+        cy.add({data: {source, target: id}, classes: "edge"})
       }
     }
-    cy.layout({name:"elk"}).run();
+    cy.layout({name: "elk"}).run();
   }
 
   // **** extra helpers
