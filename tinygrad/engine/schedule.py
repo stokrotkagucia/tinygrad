@@ -271,7 +271,7 @@ class ScheduleItem:
 
 def kernel_to_si(k:UOp) -> ScheduleItem:
   assert k.op is Ops.KERNEL, f"must be KERNEL {k}"
-  return ScheduleItem(k.arg.ast, tuple(u.buf_uop.buffer for u in k.src), k.arg.metadata)
+  return ScheduleItem(k.arg.ast, tuple(dedup(u.buf_uop.buffer for u in k.src)), k.arg.metadata)
 
 # **** Kernel creation
 
