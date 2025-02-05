@@ -3,7 +3,7 @@ from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from tinygrad.ops import UOp, Variable, Ops, GroupOp, PatternMatcher, UPat, graph_rewrite, graph_rewrite_map, track_rewrites, buffers
 from tinygrad.ops import can_pad, identity_element, resolve, symbolic_simple, view_left, merge_views
-from tinygrad.helpers import Context, ContextVar, Metadata, all_int, all_same, colored, diskcache_put, prod, dedup, getenv, unwrap, flatten
+from tinygrad.helpers import Context, ContextVar, Metadata, all_int, all_same, diskcache_put, prod, dedup, getenv, unwrap, flatten
 from tinygrad.helpers import FUSE_CONV_BW, FUSE_ARANGE, DEBUG, CAPTURE_PROCESS_REPLAY
 from tinygrad.dtype import ImageDType
 from tinygrad.shape.shapetracker import ShapeTracker
@@ -90,7 +90,6 @@ class ScheduleContext:
   allbufs: dict[UOp, UOp] = field(default_factory=dict)              # this maps BUFFER uops the actual op
   var_vals: dict[Variable, int] = field(default_factory=dict)
   children: defaultdict[UOp, dict[UOp, None]] = field(default_factory=lambda: defaultdict(dict))
-  preloads: defaultdict[Buffer, dict[UOp, None]] = field(default_factory=lambda: defaultdict(dict))
 
 # wrap tensor uops around a VIEW(BUFFER, <uop>)
 # this BUFFER preserves a link back to the uop on the tensor after the scheduler rewrites it.
@@ -236,8 +235,7 @@ def group_realizes(sink:UOp, ctx:ScheduleContext) -> dict[UOp, UOp]:
 # break the SINK into stores
 
 def load_realized(ctx:ScheduleContext, b:UOp, st:UOp):
-  # NOTE: if we're assigning to the BUFFER too, PRELOAD tells toposort to place this load before the ASSIGN
-  return UOp(Ops.PRELOAD if b in ctx.assigns else Ops.LOAD, b.dtype.base, (b, unwrap(st.st).to_uop()))
+  return UOp(Ops.LOAD, b.dtype.base, (b, unwrap(st.st).to_uop()))
 
 def store_or_fuse(ctx:ScheduleContext, b:UOp, x:UOp, st:UOp):
   if (m:=ctx.ops_metadata.get(b)) is not None: ctx.ops_metadata[x] = m
@@ -361,8 +359,6 @@ to_si = PatternMatcher([
   (UPat(Ops.ASSIGN, src=(UPat(), UPat.var("x"),)), lambda x: x),
   # don't need DEVICE anymore
   (UPat(Ops.VIEW, name="view", src=(UPat(Ops.DEVICE),)), lambda view: view.replace(src=())),
-  # PRELOAD becomes LOAD
-  (UPat(Ops.PRELOAD, name="root"), lambda root:root.replace(op=Ops.LOAD)),
   # once images are loaded they become the base dtype
   (UPat(GroupOp.All-{Ops.DEFINE_GLOBAL}, name="x"), lambda x: x.replace(dtype=x.dtype.base) if isinstance(x.dtype, ImageDType) else None),
 ])
@@ -377,24 +373,6 @@ def schedule_uop(pre:UOp, ctx:ScheduleContext) -> UOp:
   sink = graph_rewrite(graph_rewrite(pre, unbind_vars+view_left, ctx=ctx.var_vals), view_right)
   # remove extra uops from SINK + substitue BUFFER with DEFINE_GLOBAL
   ast = graph_rewrite(sink, to_si, si_ctx:=KernelContext(ctx.var_vals))
-  # deal with ASSIGN
-  if len(ctx.assigns) != 0:
-    assign_preloads = ctx.preloads[si_ctx.bufs[0].buffer]
-    for x in list(sink.toposort)[::-1]:
-      # we only allow a kernel to depend on either the before ASSIGN or after ASSIGN version of a BUFFER
-      if x.op is Ops.LOAD and x.buf_uop in assign_preloads: raise RuntimeError("cycle detected in graph")
-      # PRELOAD tells the toposort this kernel should run before ASSIGN
-      if x.op is Ops.PRELOAD:
-        assign_preloads[x.buf_uop] = None
-        # if this kernel also assigns to the buffer, we only allow either contiguous or masked views for the LOAD
-        if x.buf_uop is pre.src[0].buf_uop and not (st:=x.st_arg).contiguous:
-          # if it has a single view and it becomes contiguous when you shrink expanded axes, it's fine
-          if len(st.views) == 1 and st.shrink(tuple((0,1) if st == 0 else (0,s) for s,st in zip(st.shape, st.views[0].strides))).contiguous: pass
-          # if it has a single view and it's equal when you shrink a contig, it's fine
-          elif len(st.views) == 1 and (mask:=st.views[0].mask) is not None and ShapeTracker.from_shape(st.shape).shrink(mask) == st.shrink(mask): pass
-          # otherwise, it's not fine
-          else: raise RuntimeError("self operand of augmented assign must be contiguous.\nhelp: consider using .contiguous():\n"
-                                   +colored("   - a += a.T\n", "red")+colored("   + a += a.T.contiguous()", "green"))
   # NOTE: we only add the metadata for fused tensors
   metadata = tuple(dedup(m for x in pre.toposort if x.op is not Ops.BUFFER and (m:=ctx.ops_metadata.get(x)) is not None))
   return UOp(Ops.KERNEL, src=tuple(si_ctx.bufs), arg=Kernel(ast, metadata))
@@ -510,11 +488,9 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
     for u in sched_sink.toposort:
       if u.op is not Ops.KERNEL: continue
       for s in u.src:
-        if s.op in DONT_PLACE_IN_KERNEL: continue
-        elif is_kernel(s): pass
+        if s.op in DONT_PLACE_IN_KERNEL or is_kernel(s): continue
         # otherwise it becomes a KERNEL
-        else:
-          rep[s] = s.buf_uop.assign(UOp(Ops.KERNEL, src=s.src, arg=Kernel(ctx.realizes[s.buf_uop])))
+        rep[s] = s.buf_uop.assign(UOp(Ops.KERNEL, src=s.src, arg=Kernel(ctx.realizes[s.buf_uop])))
     if len(rep) == 0: break
     sched_sink = sched_sink.substitute(rep)
   type_verify(list(sched_sink.toposort), kernel_spec)
