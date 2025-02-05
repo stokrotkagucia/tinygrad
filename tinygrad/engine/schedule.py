@@ -69,7 +69,7 @@ sym = symbolic_simple+PatternMatcher([
   # remove CONST/BIND/BUFFER from SINK
   (UPat(Ops.SINK, name="root"),
     lambda root: UOp(Ops.SINK, root.dtype, new_src, root.arg)
-      if (new_src:=tuple(x for x in root.src if not x.is_realized and x.base.op not in {Ops.CONST, Ops.BIND})) != root.src else None),
+      if (new_src:=tuple(x.base for x in root.src if not x.is_realized and x.base.op not in {Ops.CONST, Ops.BIND})) != root.src else None),
 ])
 
 remove_movement_ops = merge_views+PatternMatcher([
@@ -278,7 +278,7 @@ def kernel_to_si(k:UOp) -> ScheduleItem:
 @dataclass(frozen=True)
 class Kernel:
   ast: UOp
-  metadata: tuple[Metadata, ...]
+  metadata: tuple[Metadata, ...] = ()
   def __repr__(self): return f"<Kernel {len(list(self.ast.toposort))} {self.ast.op} {self.metadata}>"
 
 @dataclass(frozen=True)
@@ -399,12 +399,75 @@ def schedule_uop(pre:UOp, ctx:ScheduleContext) -> UOp:
   metadata = tuple(dedup(m for x in pre.toposort if x.op is not Ops.BUFFER and (m:=ctx.ops_metadata.get(x)) is not None))
   return UOp(Ops.KERNEL, src=tuple(si_ctx.bufs), arg=Kernel(ast, metadata))
 
+def fix_kernel(ctx:ScheduleContext, x:UOp):
+  if x.arg.ast.op in {Ops.SINK, Ops.COPY, Ops.BUFFER_VIEW}: return None
+  new_kernel = schedule_uop(x.arg.ast.sink(), ctx)
+  return x.replace(arg=new_kernel.arg, src=tuple(s for s in x.src if s.buf_uop in new_kernel.src))
+fix_kernels = PatternMatcher([
+  (UPat(Ops.KERNEL, name="x"), fix_kernel),
+])
+
+DONT_PLACE_IN_KERNEL = {Ops.KERNEL, Ops.BUFFER}
+
+def is_kernel(s:UOp):
+  return s.op is Ops.ASSIGN and s.src[1].op is Ops.KERNEL
+
+def init_sink(ctx, x:UOp):
+  if all(is_kernel(s) for s in x.src): return None
+  new_src: list[UOp] = []
+  for s in x.src:
+    kernel = UOp(Ops.KERNEL, src=s.src, arg=Kernel(ctx.realizes[s.buf_uop]))
+    assign = s.buf_uop.assign(kernel)
+    new_src.append(assign)
+  return x.replace(src=tuple(new_src))
+
+DONT_PLACE_IN_KERNEL = {Ops.KERNEL, Ops.BUFFER}
+def append_to_kernel(ctx:ScheduleContext, x:UOp):
+  new_src: list[UOp] = []
+  for s in x.src:
+    if s.op in DONT_PLACE_IN_KERNEL: pass
+    elif is_kernel(s): pass
+    elif is_scheduled(s) and s.buf_uop in ctx.realizes: pass
+    else:
+      new_src.extend(s.src)
+      continue
+    new_src.append(s)
+  if tuple(new_src) == x.src: return None
+  return x.replace(src=tuple(new_src))
+
 create_kernels = PatternMatcher([
-  (UPat(Ops.SINK, name="x"), lambda ctx,x: x.replace(src=tuple(schedule_uop(s.sink(), ctx) for s in x.src))
-    if any(s.op is not Ops.KERNEL for s in x.src) else None),
+  (UPat(Ops.SINK, name="x"), init_sink),
+  (UPat(Ops.KERNEL, name="x"), append_to_kernel),
 ])
 
 # **** schedule creation and toposort
+
+def linearize_schedule(sched_sink:UOp) -> list[ScheduleItem]:
+  # if a kernel depends on a buffer, and that buffer is later assigned to, make the assign depends on the kernel's assign
+  kernel_assigns: list[UOp] = []
+  for x in sched_sink.toposort:
+    if x.op is Ops.ASSIGN: kernel_assigns.append(x)
+  replacements = {}
+  for x in sched_sink.toposort:
+    if x.op is Ops.ASSIGN:
+      assigned_to = x.src[0]
+      new_srcs = []
+      for ka in kernel_assigns:
+        k = ka.src[1]
+        if k not in x.src and any(y is assigned_to for y in k.src): new_srcs.append(ka)
+      if len(new_srcs):
+        assert x not in replacements
+        replacements[x] = x.replace(src=x.src+tuple(new_srcs))
+  new_sched_sink = sched_sink.substitute(replacements)
+
+  # display
+  if getenv("VIZ"): graph_rewrite(new_sched_sink, PatternMatcher([]))
+
+  # final toposort
+  new_schedule = []
+  for x in new_sched_sink.toposort:
+    if x.op is Ops.ASSIGN: new_schedule.append(kernel_to_si(x.src[1]))
+  return new_schedule
 
 @track_rewrites(named=True)
 def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Variable, int], dict[UOp, UOp]]:
@@ -437,44 +500,27 @@ def create_schedule_with_vars(big_sink:UOp) -> tuple[list[ScheduleItem], dict[Va
     for tensor_uop in buf_tensors[buf_uop]: becomes_map[tensor_uop] = buf_uop.view(unwrap(tensor_uop.st))
     buf_uop.buffer.ref(1)
 
-  # create kernels, TODO: this should use the SINK from tensor_map
+  # break the graph into kernels
   graph_rewrite(sink, break_sched, ctx)
-  sched_sink = graph_rewrite(UOp.sink(*realize_map.values()), create_kernels, ctx)
+  # recursively construct the kernel graph
+  sched_sink = sink
+  while 1:
+    sched_sink = graph_rewrite(sched_sink, create_kernels, ctx)
+    rep: dict[UOp, UOp] = {}
+    for u in sched_sink.toposort:
+      if u.op is not Ops.KERNEL: continue
+      for s in u.src:
+        if s.op in DONT_PLACE_IN_KERNEL: continue
+        elif is_kernel(s): pass
+        # otherwise it becomes a KERNEL
+        else:
+          rep[s] = s.buf_uop.assign(UOp(Ops.KERNEL, src=s.src, arg=Kernel(ctx.realizes[s.buf_uop])))
+    if len(rep) == 0: break
+    sched_sink = sched_sink.substitute(rep)
   type_verify(list(sched_sink.toposort), kernel_spec)
+  sched_sink = graph_rewrite(sched_sink, fix_kernels, ctx)
 
-  # TODO: this should be the break between the "grouper" and the "linearizer"
-  # here, there should just be one sink UOp with BUFFER/KERNEL/COPY/ASSIGN (assign is the parent if you want the buffer post assign)
-  # call into `def linearize_schedule(sched_sink:UOp) -> list[ScheduleItem]`
-
-  # convert kernels to ScheduleItem
-  prescheduled = [kernel_to_si(k) for k in sched_sink.src]
-  # add ScheduleItem children
-  # TODO: this should construct the graph directly from the sched_sink
-  schedule_targets = {out:si for si in prescheduled for out in si.outputs}
-  graph: defaultdict[ScheduleItem, list[ScheduleItem]] = defaultdict(list)
-  in_degree: defaultdict[ScheduleItem, int] = defaultdict(int)
-  for si in prescheduled:
-    # realize outputs before a parent is assigned to
-    parents_assigns = dedup(xsi for x in ctx.preloads[si.bufs[0]] if (xsi:=schedule_targets.get(x.buffer)) and xsi is not si)
-    for assign in parents_assigns:
-      graph[si].append(assign)
-      in_degree[assign] += 1
-    # realize outputs after all parents are realized
-    scheduled_parents = dedup(xsi for x in si.inputs if (xsi:=schedule_targets.get(x)) is not None and xsi not in parents_assigns)
-    for x in scheduled_parents:
-      graph[x].append(si)
-      in_degree[si] += 1
-
-  # do BFS
-  queue = deque(si for si in prescheduled if in_degree[si] == 0)
-  schedule: list[ScheduleItem] = []
-  while queue:
-    schedule.append(si:=queue.popleft())
-    for x in graph[si]:
-      in_degree[x] -= 1
-      if in_degree[x] == 0: queue.append(x)
-  # confirm everything was scheduled correctly
-  if len(schedule) != (groups:=len(prescheduled)): raise RuntimeError(f"cycle detected in graph, grouped {groups} but only scheduled {len(schedule)}")
+  schedule = linearize_schedule(sched_sink)
   if DEBUG >= 1 and len(schedule) >= 10: print(f"scheduled {len(schedule)} kernels")
   # capture process replay
   if CAPTURE_PROCESS_REPLAY:
